@@ -1,0 +1,550 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.17;
+
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
+import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+
+/**
+ * @title SolarFunding
+ * @dev Contract for crowdfunding PLTS (solar panel) projects with monthly returns based on energy production
+ */
+contract SolarFunding is Ownable, ReentrancyGuard {
+    using SafeERC20 for IERC20;
+    
+    // IDRX token interface
+    IERC20 public idrxToken;
+
+    // Constants
+    uint256 public constant SECONDS_IN_MONTH = 30 days;
+    uint256 public constant BASIS_POINTS = 10000; // 100% = 10000 basis points
+
+    // Project status enum
+    enum ProjectStatus {
+        Funding,       // Project is in funding phase
+        Active,        // Project is funded and producing energy
+        Completed,     // Project has completed its contract term
+        Cancelled      // Project was cancelled before completion
+    }
+
+    // Project data
+    struct Project {
+        string name;                    // Project name
+        string location;                // Project location
+        uint256 fundingGoal;            // Total funding needed in Wei
+        uint256 fundingRaised;          // Total funding raised so far in Wei
+        uint256 installationCost;       // Cost to install the system
+        uint256 expectedMonthlyProduction; // Expected kWh production per month
+        uint256 pricePerKwh;            // Price per kWh in Wei
+        uint256 plnPricePerKwh;         // PLN price per kWh for comparison
+        uint256 savingsPercentage;      // Savings percentage compared to PLN (in basis points)
+        uint256 monthlyMaintenanceCost; // Monthly maintenance cost in Wei
+        uint256 returnPercentage;       // Monthly return percentage for investors (in basis points)
+        uint256 contractDurationMonths; // Contract duration in months
+        uint256 fundingDeadline;        // Deadline for funding
+        uint256 startDate;              // Date when the project began producing energy
+        uint256 totalEnergyProduced;    // Total energy produced in kWh
+        uint256 totalRevenueGenerated;  // Total revenue generated in Wei
+        uint256 totalReturnDistributed; // Total return distributed to investors in Wei
+        address developer;              // Developer address
+        ProjectStatus status;           // Project status
+    }
+
+    // Investor data
+    struct Investment {
+        uint256 amount;          // Investment amount in Wei
+        uint256 shares;          // Number of shares
+        uint256 claimedReturns;  // Returns already claimed in Wei
+        uint256 lastClaimDate;   // Last date when returns were claimed
+    }
+
+    // Energy production data
+    struct EnergyReport {
+        uint256 timestamp;       // Timestamp when the report was submitted
+        uint256 energyProduced;  // Energy produced in kWh
+        uint256 revenue;         // Revenue generated in Wei
+        address reporter;        // Address of the reporter
+        bool verified;           // Whether the report has been verified
+    }
+
+    // Oracle data
+    struct Oracle {
+        bool isActive;           // Whether the oracle is active
+        string description;      // Description of the oracle
+    }
+
+    // Storage
+    Project[] public projects;
+    mapping(uint256 => mapping(address => Investment)) public investments;
+    mapping(uint256 => EnergyReport[]) public energyReports;
+    mapping(address => bool) public isDeveloper;
+    mapping(address => bool) public isOracle;
+
+    // Events
+    event ProjectCreated(uint256 indexed projectId, address developer, string name, uint256 fundingGoal);
+    event InvestmentMade(uint256 indexed projectId, address investor, uint256 amount);
+    event ProjectFunded(uint256 indexed projectId, uint256 totalRaised);
+    event ProjectActivated(uint256 indexed projectId, uint256 startDate);
+    event EnergyReportSubmitted(uint256 indexed projectId, uint256 reportId, uint256 energyProduced, uint256 revenue);
+    event EnergyReportVerified(uint256 indexed projectId, uint256 reportId);
+    event ReturnsClaimed(uint256 indexed projectId, address investor, uint256 amount);
+    event ProjectCompleted(uint256 indexed projectId);
+    event ProjectCancelled(uint256 indexed projectId);
+    event DeveloperAdded(address developer);
+    event DeveloperRemoved(address developer);
+    event OracleAdded(address oracle, string description);
+    event OracleRemoved(address oracle);
+
+    /**
+     * @dev Constructor
+     * @param _idrxTokenAddress Address of the IDRX token contract
+     */
+    constructor(address _idrxTokenAddress) Ownable(msg.sender) {
+        require(_idrxTokenAddress != address(0), "Invalid IDRX token address");
+        idrxToken = IERC20(_idrxTokenAddress);
+        
+        // Add contract deployer as developer and oracle
+        isDeveloper[msg.sender] = true;
+        isOracle[msg.sender] = true;
+    }
+
+    /**
+     * @dev Add a developer
+     * @param _developer Developer address
+     */
+    function addDeveloper(address _developer) external onlyOwner {
+        isDeveloper[_developer] = true;
+        emit DeveloperAdded(_developer);
+    }
+
+    /**
+     * @dev Remove a developer
+     * @param _developer Developer address
+     */
+    function removeDeveloper(address _developer) external onlyOwner {
+        isDeveloper[_developer] = false;
+        emit DeveloperRemoved(_developer);
+    }
+
+    /**
+     * @dev Add an oracle
+     * @param _oracle Oracle address
+     * @param _description Description of the oracle
+     */
+    function addOracle(address _oracle, string memory _description) external onlyOwner {
+        isOracle[_oracle] = true;
+        emit OracleAdded(_oracle, _description);
+    }
+
+    /**
+     * @dev Remove an oracle
+     * @param _oracle Oracle address
+     */
+    function removeOracle(address _oracle) external onlyOwner {
+        isOracle[_oracle] = false;
+        emit OracleRemoved(_oracle);
+    }
+
+    /**
+     * @dev Create a new solar project
+     * @param _name Project name
+     * @param _location Project location
+     * @param _fundingGoal Total funding needed in Wei
+     * @param _installationCost Cost to install the system
+     * @param _expectedMonthlyProduction Expected kWh production per month
+     * @param _pricePerKwh Price per kWh in Wei
+     * @param _plnPricePerKwh PLN price per kWh for comparison
+     * @param _savingsPercentage Savings percentage compared to PLN (in basis points)
+     * @param _monthlyMaintenanceCost Monthly maintenance cost in Wei
+     * @param _returnPercentage Monthly return percentage for investors (in basis points)
+     * @param _contractDurationMonths Contract duration in months
+     * @param _fundingDurationDays Duration of funding period in days
+     */
+    function createProject(
+        string memory _name,
+        string memory _location,
+        uint256 _fundingGoal,
+        uint256 _installationCost,
+        uint256 _expectedMonthlyProduction,
+        uint256 _pricePerKwh,
+        uint256 _plnPricePerKwh,
+        uint256 _savingsPercentage,
+        uint256 _monthlyMaintenanceCost,
+        uint256 _returnPercentage,
+        uint256 _contractDurationMonths,
+        uint256 _fundingDurationDays
+    ) external {
+        require(isDeveloper[msg.sender], "Only developers can create projects");
+        require(_fundingGoal > 0, "Funding goal must be positive");
+        require(_expectedMonthlyProduction > 0, "Expected production must be positive");
+        require(_pricePerKwh > 0, "Price per kWh must be positive");
+        require(_contractDurationMonths >= 180, "Contract duration must be at least 180 months (15 years)");
+        require(_savingsPercentage >= 500 && _savingsPercentage <= 1500, "Savings must be between 5% and 15%");
+        require(_returnPercentage > 0, "Return percentage must be positive");
+
+        // Calculate PLN price with discount
+        require(_pricePerKwh < _plnPricePerKwh, "Price must be lower than PLN price");
+        
+        // Create new project
+        Project memory newProject = Project({
+            name: _name,
+            location: _location,
+            fundingGoal: _fundingGoal,
+            fundingRaised: 0,
+            installationCost: _installationCost,
+            expectedMonthlyProduction: _expectedMonthlyProduction,
+            pricePerKwh: _pricePerKwh,
+            plnPricePerKwh: _plnPricePerKwh,
+            savingsPercentage: _savingsPercentage,
+            monthlyMaintenanceCost: _monthlyMaintenanceCost,
+            returnPercentage: _returnPercentage,
+            contractDurationMonths: _contractDurationMonths,
+            fundingDeadline: block.timestamp + (_fundingDurationDays * 1 days),
+            startDate: 0,
+            totalEnergyProduced: 0,
+            totalRevenueGenerated: 0,
+            totalReturnDistributed: 0,
+            developer: msg.sender,
+            status: ProjectStatus.Funding
+        });
+
+        uint256 projectId = projects.length;
+        projects.push(newProject);
+        emit ProjectCreated(projectId, msg.sender, _name, _fundingGoal);
+    }
+
+    /**
+     * @dev Invest in a project using IDRX
+     * @param _projectId Project ID
+     * @param _amount Amount of IDRX to invest
+     */
+    function invest(uint256 _projectId, uint256 _amount) external nonReentrant {
+        require(_projectId < projects.length, "Project does not exist");
+        Project storage project = projects[_projectId];
+        
+        require(project.status == ProjectStatus.Funding, "Project is not in funding phase");
+        require(block.timestamp < project.fundingDeadline, "Funding deadline has passed");
+        require(_amount > 0, "Investment amount must be positive");
+        
+        uint256 remainingFunding = project.fundingGoal - project.fundingRaised;
+        uint256 investmentAmount = (_amount > remainingFunding) ? remainingFunding : _amount;
+        
+        // Transfer IDRX from investor to contract
+        idrxToken.safeTransferFrom(msg.sender, address(this), investmentAmount);
+        
+        // Update project funding
+        project.fundingRaised += investmentAmount;
+        
+        // Update investor's investment
+        Investment storage investment = investments[_projectId][msg.sender];
+        investment.amount += investmentAmount;
+        investment.shares += investmentAmount;
+        investment.lastClaimDate = block.timestamp;
+        
+        emit InvestmentMade(_projectId, msg.sender, investmentAmount);
+        
+        // If funding goal is reached, update project status
+        if (project.fundingRaised >= project.fundingGoal) {
+            project.status = ProjectStatus.Active;
+            project.startDate = block.timestamp;
+            emit ProjectFunded(_projectId, project.fundingRaised);
+            emit ProjectActivated(_projectId, project.startDate);
+        }
+        
+        // Refund excess investment
+        if (_amount > investmentAmount) {
+            idrxToken.safeTransfer(msg.sender, _amount - investmentAmount);
+        }
+    }
+
+    /**
+     * @dev Submit energy production report
+     * @param _projectId Project ID
+     * @param _energyProduced Energy produced in kWh
+     */
+    function submitEnergyReport(uint256 _projectId, uint256 _energyProduced) external {
+        require(_projectId < projects.length, "Project does not exist");
+        Project storage project = projects[_projectId];
+        
+        require(project.status == ProjectStatus.Active, "Project is not active");
+        require(msg.sender == project.developer || isOracle[msg.sender], "Only developer or oracle can submit reports");
+        
+        // Calculate revenue based on energy produced and price per kWh
+        uint256 revenue = _energyProduced * project.pricePerKwh;
+        
+        // Create energy report
+        EnergyReport memory report = EnergyReport({
+            timestamp: block.timestamp,
+            energyProduced: _energyProduced,
+            revenue: revenue,
+            reporter: msg.sender,
+            verified: isOracle[msg.sender] // Auto-verify if submitted by oracle
+        });
+        
+        uint256 reportId = energyReports[_projectId].length;
+        energyReports[_projectId].push(report);
+        
+        emit EnergyReportSubmitted(_projectId, reportId, _energyProduced, revenue);
+        
+        if (isOracle[msg.sender]) {
+            emit EnergyReportVerified(_projectId, reportId);
+            
+            // Update project data
+            project.totalEnergyProduced += _energyProduced;
+            project.totalRevenueGenerated += revenue;
+            
+            // Check if project contract duration is over
+            if (block.timestamp >= project.startDate + (project.contractDurationMonths * SECONDS_IN_MONTH)) {
+                project.status = ProjectStatus.Completed;
+                emit ProjectCompleted(_projectId);
+            }
+        }
+    }
+
+    /**
+     * @dev Verify energy production report
+     * @param _projectId Project ID
+     * @param _reportId Report ID
+     */
+    function verifyEnergyReport(uint256 _projectId, uint256 _reportId) external {
+        require(_projectId < projects.length, "Project does not exist");
+        require(_reportId < energyReports[_projectId].length, "Report does not exist");
+        require(isOracle[msg.sender], "Only oracle can verify reports");
+        
+        EnergyReport storage report = energyReports[_projectId][_reportId];
+        Project storage project = projects[_projectId];
+        
+        require(!report.verified, "Report already verified");
+        
+        report.verified = true;
+        emit EnergyReportVerified(_projectId, _reportId);
+        
+        // Update project data
+        project.totalEnergyProduced += report.energyProduced;
+        project.totalRevenueGenerated += report.revenue;
+        
+        // Check if project contract duration is over
+        if (block.timestamp >= project.startDate + (project.contractDurationMonths * SECONDS_IN_MONTH)) {
+            project.status = ProjectStatus.Completed;
+            emit ProjectCompleted(_projectId);
+        }
+    }
+
+    /**
+     * @dev Claim returns for investor in IDRX
+     * @param _projectId Project ID
+     */
+    function claimReturns(uint256 _projectId) external nonReentrant {
+        require(_projectId < projects.length, "Project does not exist");
+        Project storage project = projects[_projectId];
+        Investment storage investment = investments[_projectId][msg.sender];
+        
+        require(investment.amount > 0, "No investment found");
+        require(project.status == ProjectStatus.Active || project.status == ProjectStatus.Completed, "Project is not active or completed");
+        
+        // Calculate investor's share of revenue
+        uint256 investorShare = (investment.shares * BASIS_POINTS) / project.fundingRaised;
+        
+        // Calculate revenue since last claim
+        uint256 netRevenue = project.totalRevenueGenerated;
+        uint256 maintenanceCost = 0;
+        
+        if (project.startDate > 0) {
+            uint256 monthsSinceStart = (block.timestamp - project.startDate) / SECONDS_IN_MONTH;
+            maintenanceCost = monthsSinceStart * project.monthlyMaintenanceCost;
+        }
+        
+        if (maintenanceCost < netRevenue) {
+            netRevenue -= maintenanceCost;
+        } else {
+            netRevenue = 0;
+        }
+        
+        // Apply monthly return percentage
+        uint256 monthsInContract = (block.timestamp - investment.lastClaimDate) / SECONDS_IN_MONTH;
+        if (monthsInContract == 0) monthsInContract = 1; // Ensure at least one month
+        
+        uint256 expectedReturn = investment.amount * project.returnPercentage * monthsInContract / (BASIS_POINTS * 12);
+        
+        // Calculate actual return based on energy production
+        uint256 investorRevenue = (netRevenue * investorShare) / BASIS_POINTS;
+        uint256 claimableAmount = investorRevenue > expectedReturn ? expectedReturn : investorRevenue;
+        
+        // Ensure we don't claim more than what's available
+        uint256 idrxBalance = idrxToken.balanceOf(address(this));
+        if (claimableAmount > idrxBalance) {
+            claimableAmount = idrxBalance;
+        }
+        
+        require(claimableAmount > 0, "No returns to claim");
+        
+        // Update investment record
+        investment.claimedReturns += claimableAmount;
+        investment.lastClaimDate = block.timestamp;
+        
+        // Update project record
+        project.totalReturnDistributed += claimableAmount;
+        
+        // Transfer IDRX returns to investor
+        idrxToken.safeTransfer(msg.sender, claimableAmount);
+        
+        emit ReturnsClaimed(_projectId, msg.sender, claimableAmount);
+    }
+
+    /**
+     * @dev Cancel project if funding deadline has passed and goal not reached
+     * @param _projectId Project ID
+     */
+    function cancelProject(uint256 _projectId) external {
+        require(_projectId < projects.length, "Project does not exist");
+        Project storage project = projects[_projectId];
+        
+        require(project.status == ProjectStatus.Funding, "Project is not in funding phase");
+        require(block.timestamp > project.fundingDeadline, "Funding deadline has not passed yet");
+        require(project.fundingRaised < project.fundingGoal, "Funding goal reached, cannot cancel");
+        
+        project.status = ProjectStatus.Cancelled;
+        emit ProjectCancelled(_projectId);
+    }
+
+    /**
+     * @dev Refund investment in IDRX if project is cancelled
+     * @param _projectId Project ID
+     */
+    function refundInvestment(uint256 _projectId) external nonReentrant {
+        require(_projectId < projects.length, "Project does not exist");
+        Project storage project = projects[_projectId];
+        Investment storage investment = investments[_projectId][msg.sender];
+        
+        require(project.status == ProjectStatus.Cancelled, "Project is not cancelled");
+        require(investment.amount > 0, "No investment found");
+        
+        uint256 refundAmount = investment.amount;
+        
+        // Reset investment record
+        investment.amount = 0;
+        investment.shares = 0;
+        investment.claimedReturns = 0;
+        
+        // Transfer IDRX refund to investor
+        idrxToken.safeTransfer(msg.sender, refundAmount);
+    }
+
+    /**
+     * @dev Get project details
+     * @param _projectId Project ID
+     * @return Project details
+     */
+    function getProjectDetails(uint256 _projectId) external view returns (Project memory) {
+        require(_projectId < projects.length, "Project does not exist");
+        return projects[_projectId];
+    }
+
+    /**
+     * @dev Get investor details for a project
+     * @param _projectId Project ID
+     * @param _investor Investor address
+     * @return Investment details
+     */
+    function getInvestmentDetails(uint256 _projectId, address _investor) external view returns (Investment memory) {
+        require(_projectId < projects.length, "Project does not exist");
+        return investments[_projectId][_investor];
+    }
+
+    /**
+     * @dev Get energy report details
+     * @param _projectId Project ID
+     * @param _reportId Report ID
+     * @return EnergyReport details
+     */
+    function getEnergyReportDetails(uint256 _projectId, uint256 _reportId) external view returns (EnergyReport memory) {
+        require(_projectId < projects.length, "Project does not exist");
+        require(_reportId < energyReports[_projectId].length, "Report does not exist");
+        return energyReports[_projectId][_reportId];
+    }
+
+    /**
+     * @dev Get number of energy reports for a project
+     * @param _projectId Project ID
+     * @return Number of reports
+     */
+    function getEnergyReportCount(uint256 _projectId) external view returns (uint256) {
+        require(_projectId < projects.length, "Project does not exist");
+        return energyReports[_projectId].length;
+    }
+
+    /**
+     * @dev Get number of projects
+     * @return Number of projects
+     */
+    function getProjectCount() external view returns (uint256) {
+        return projects.length;
+    }
+
+    /**
+     * @dev Get claimable returns for an investor
+     * @param _projectId Project ID
+     * @param _investor Investor address
+     * @return Claimable amount
+     */
+    function getClaimableReturns(uint256 _projectId, address _investor) external view returns (uint256) {
+        require(_projectId < projects.length, "Project does not exist");
+        Project storage project = projects[_projectId];
+        Investment storage investment = investments[_projectId][_investor];
+        
+        if (investment.amount == 0 || 
+            (project.status != ProjectStatus.Active && project.status != ProjectStatus.Completed)) {
+            return 0;
+        }
+        
+        // Calculate investor's share of revenue
+        uint256 investorShare = (investment.shares * BASIS_POINTS) / project.fundingRaised;
+        
+        // Calculate revenue since last claim
+        uint256 netRevenue = project.totalRevenueGenerated;
+        uint256 maintenanceCost = 0;
+        
+        if (project.startDate > 0) {
+            uint256 monthsSinceStart = (block.timestamp - project.startDate) / SECONDS_IN_MONTH;
+            maintenanceCost = monthsSinceStart * project.monthlyMaintenanceCost;
+        }
+        
+        if (maintenanceCost < netRevenue) {
+            netRevenue -= maintenanceCost;
+        } else {
+            netRevenue = 0;
+        }
+        
+        // Apply monthly return percentage
+        uint256 monthsInContract = (block.timestamp - investment.lastClaimDate) / SECONDS_IN_MONTH;
+        if (monthsInContract == 0) monthsInContract = 1; // Ensure at least one month
+        
+        uint256 expectedReturn = investment.amount * project.returnPercentage * monthsInContract / (BASIS_POINTS * 12);
+        
+        // Calculate actual return based on energy production
+        uint256 investorRevenue = (netRevenue * investorShare) / BASIS_POINTS;
+        uint256 claimableAmount = investorRevenue > expectedReturn ? expectedReturn : investorRevenue;
+        
+        return claimableAmount;
+    }
+
+    /**
+     * @dev Withdraw IDRX tokens (for emergency use)
+     * @param _amount Amount of IDRX to withdraw
+     */
+    function withdrawEmergencyIDRX(uint256 _amount) external onlyOwner {
+        uint256 idrxBalance = idrxToken.balanceOf(address(this));
+        require(_amount <= idrxBalance, "Insufficient IDRX balance");
+        idrxToken.safeTransfer(owner(), _amount);
+    }
+    
+    /**
+     * @dev Add IDRX tokens to contract (for developer or customer payments)
+     * @param _amount Amount of IDRX to add
+     */
+    function addIDRXFunds(uint256 _amount) external {
+        require(_amount > 0, "Amount must be positive");
+        idrxToken.safeTransferFrom(msg.sender, address(this), _amount);
+    }
+}
