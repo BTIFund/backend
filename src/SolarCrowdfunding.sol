@@ -182,6 +182,40 @@ contract SolarCrowdfunding is Ownable, ReentrancyGuard {
     }
 
     /**
+    * @dev Mendapatkan semua ID proyek yang sudah mendapatkan investasi
+    * Fungsi ini return ID project yang memiliki dana yang terkumpul (fundingRaised > 0)
+    * @return investedProjectIds Daftar ID proyek yang sudah melakukan investasi
+    */
+    function getInvestedProjectIds() external view returns (uint256[] memory) {
+        uint256 investedCount = 0;
+
+        // Hitung jumlah proyek yang sudah mendapatkan investasi
+        for (uint256 i = 0; i < projects.length; i++) {
+            Project storage project = projects[i];
+            
+            // Periksa apakah ada investasi pada proyek ini
+            if (project.fundingRaised > 0) {
+                investedCount++;
+            }
+        }
+
+        uint256[] memory investedProjectIds = new uint256[](investedCount);
+        uint256 index = 0;
+
+        // Masukkan ID proyek yang sudah diinvestasikan ke dalam array
+        for (uint256 i = 0; i < projects.length; i++) {
+            Project storage project = projects[i];
+            
+            if (project.fundingRaised > 0) {
+                investedProjectIds[index] = i;
+                index++;
+            }
+        }
+
+        return investedProjectIds;
+    }
+
+    /**
      * @dev Distribute monthly returns to project investors
      * @param _projectId Project ID
      */
