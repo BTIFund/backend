@@ -129,6 +129,18 @@ contract SolarCrowdfunding is Ownable, ReentrancyGuard {
     }
 
     /**
+    * @dev Mendapatkan semua ID proyek yang ada
+    * @return projectIds Daftar ID proyek yang ada di dalam kontrak
+    */
+    function getAllProjectIds() external view returns (uint256[] memory) {
+        uint256[] memory projectIds = new uint256[](projects.length);
+        for (uint256 i = 0; i < projects.length; i++) {
+            projectIds[i] = i;
+        }
+        return projectIds;
+    }
+
+    /**
      * @dev Invest in a project using IDRX
      * @param _projectId Project ID
      * @param _amount Amount of IDRX to invest
@@ -254,7 +266,11 @@ contract SolarCrowdfunding is Ownable, ReentrancyGuard {
         require(investment.amount > 0, "No investment found");
         
         uint256 refundAmount = investment.amount;
-        
+
+        // Check the contract's balance to ensure it has enough IDRX to refund
+        uint256 contractBalance = idrxToken.balanceOf(address(this));
+        require(contractBalance >= refundAmount, "Insufficient balance in contract");
+
         // Reset investment record
         investment.amount = 0;
         investment.claimedReturns = 0;
@@ -262,6 +278,7 @@ contract SolarCrowdfunding is Ownable, ReentrancyGuard {
         // Transfer IDRX refund to investor
         idrxToken.safeTransfer(msg.sender, refundAmount);
     }
+
 
     /**
      * @dev Complete a project (only owner can call)
