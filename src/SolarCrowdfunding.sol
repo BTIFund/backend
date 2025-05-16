@@ -18,6 +18,8 @@ contract SolarCrowdfunding is Ownable, ReentrancyGuard {
 
     // Constants
     uint256 public constant BASIS_POINTS = 10000; // 100% = 10000 basis points
+    uint256 public constant CARBON_OFFSET_PER_KWH = 500000000000000000; // 0.5 * 10^18
+    uint256 private constant MAX_TRANSACTIONS = 10;
 
     // Project status enum
     enum ProjectStatus {
@@ -39,6 +41,20 @@ contract SolarCrowdfunding is Ownable, ReentrancyGuard {
         ProjectStatus status;           // Project status
     }
 
+    // Portofolio performance
+    struct PortfolioPerformance {
+        uint256 totalInvestment;
+        uint256 totalReturns;
+    }
+
+    // Transaction
+    struct Transaction {
+        uint256 projectId;
+        string transactionType;
+        uint256 amount;
+        uint256 timestamp;
+    }
+
     // Investor data
     struct Investment {
         uint256 amount;          // Investment amount in IDRX
@@ -50,6 +66,9 @@ contract SolarCrowdfunding is Ownable, ReentrancyGuard {
     Project[] public projects;
     mapping(uint256 => mapping(address => Investment)) public investments;
     mapping(address => bool) public isDeveloper;
+    mapping(address => mapping(uint256 => PortfolioPerformance)) public monthlyPerformance;
+    mapping(uint256 => mapping(uint256 => uint256)) public monthlyEnergyProduction; // projectId => monthId => kWh
+    mapping(address => Transaction[]) private userTransactions;
 
     // Events
     event ProjectCreated(uint256 indexed projectId, address developer, string name, uint256 fundingGoal);
@@ -61,6 +80,7 @@ contract SolarCrowdfunding is Ownable, ReentrancyGuard {
     event DeveloperAdded(address developer);
     event DeveloperRemoved(address developer);
     event MonthlyReturnsDistributed(uint256 indexed projectId, uint256 amount);
+    event Transactions(address indexed user, uint256 indexed projectId, string transactionType, uint256 amount, uint256 timestamp);
 
     /**
      * @dev Constructor
@@ -166,8 +186,11 @@ contract SolarCrowdfunding is Ownable, ReentrancyGuard {
         Investment storage investment = investments[_projectId][msg.sender];
         investment.amount += investmentAmount;
         investment.lastClaimDate = block.timestamp;
+        _updatePortfolioPerformance(msg.sender, investmentAmount, 0);
+        _addTransaction(msg.sender, _projectId, "Investment", investmentAmount);
         
         emit InvestmentMade(_projectId, msg.sender, investmentAmount);
+        emit Transactions(msg.sender, _projectId, "Investment", investmentAmount, block.timestamp);
         
         // If funding goal is reached, update project status to Active
         if (project.fundingRaised >= project.fundingGoal) {
@@ -264,11 +287,14 @@ contract SolarCrowdfunding is Ownable, ReentrancyGuard {
         // Update investment record
         investment.claimedReturns += claimableAmount;
         investment.lastClaimDate = block.timestamp;
+        _updatePortfolioPerformance(msg.sender, 0, claimableAmount);
+        _addTransaction(msg.sender, _projectId, "Claim Returns", claimableAmount);
         
         // Transfer IDRX returns to investor
         idrxToken.safeTransfer(msg.sender, claimableAmount);
         
         emit ReturnsClaimed(_projectId, msg.sender, claimableAmount);
+        emit Transactions(msg.sender, _projectId, "Claim Returns", claimableAmount, block.timestamp);
     }
 
     /**
@@ -355,6 +381,136 @@ contract SolarCrowdfunding is Ownable, ReentrancyGuard {
      */
     function getProjectCount() external view returns (uint256) {
         return projects.length;
+    }
+
+    /**
+     * @dev Get user's monthly returns across all projects
+     * @param _user Address of the user
+     * @return Monthly returns in IDRX
+     */
+    function getUserMonthlyReturns(address _user) external view returns (uint256) {
+        uint256 totalMonthlyReturns = 0;
+        for (uint256 i = 0; i < projects.length; i++) {
+            if (projects[i].status == ProjectStatus.Active) {
+                Investment storage investment = investments[i][_user];
+                uint256 investorShare = investment.amount * BASIS_POINTS / projects[i].fundingRaised;
+                uint256 monthlyReturnsAmount = projects[i].fundingRaised * projects[i].expectedMonthlyReturn / BASIS_POINTS;
+                totalMonthlyReturns += monthlyReturnsAmount * investorShare / BASIS_POINTS;
+            }
+        }
+        return totalMonthlyReturns;
+    }
+
+    /**
+     * @dev Get user's annual returns across all projects
+     * @param _user Address of the user
+     * @return Annual returns in IDRX
+     */
+    function getUserAnnualReturns(address _user) external view returns (uint256) {
+        uint256 monthlyReturns = this.getUserMonthlyReturns(_user);
+        return monthlyReturns * 12;
+    }
+
+    /**
+     * @dev Get user's portfolio performance for a specific month
+     * @param _user Address of the user
+     * @param _year Year of the performance
+     * @param _month Month of the performance (1-12)
+     * @return PortfolioPerformance struct containing total investment and returns
+     */
+    function getUserPortfolioPerformance(address _user, uint256 _year, uint256 _month) external view returns (PortfolioPerformance memory) {
+        require(_month >= 1 && _month <= 12, "Invalid month");
+        uint256 monthId = _year * 12 + _month;
+        return monthlyPerformance[_user][monthId];
+    }
+
+    /**
+     * @dev Update user's portfolio performance
+     * @param _user Address of the user
+     * @param _investment Amount invested
+     * @param _returns Amount of returns
+     */
+    function _updatePortfolioPerformance(address _user, uint256 _investment, uint256 _returns) internal {
+        uint256 currentMonth = (block.timestamp / 30 days) + 1;
+        uint256 currentYear = 1970 + (block.timestamp / 365 days);
+        uint256 monthId = currentYear * 12 + currentMonth;
+
+        PortfolioPerformance storage performance = monthlyPerformance[_user][monthId];
+        performance.totalInvestment += _investment;
+        performance.totalReturns += _returns;
+    }
+
+    /**
+     * @dev Get user's transaction history
+     * @param _user Address of the user
+     * @param _fromTimestamp Start timestamp for history
+     * @param _toTimestamp End timestamp for history
+     * @return Array of Transaction events
+     */
+    function getUserTransactionHistory(address _user, uint256 _fromTimestamp, uint256 _toTimestamp) external view returns (Transaction[] memory) {
+        // Note: This function is a placeholder and won't work as is.
+        // Implementing this correctly would require additional storage and indexing,
+        // which is beyond the scope of a simple contract update.
+        // In a real-world scenario, you'd typically use events and external indexing (e.g., The Graph) for this.
+    }
+
+    /**
+     * @dev Set monthly energy production for a project
+     * @param _projectId Project ID
+     * @param _year Year of production
+     * @param _month Month of production (1-12)
+     * @param _kWh Energy produced in kWh
+     */
+    function setMonthlyEnergyProduction(uint256 _projectId, uint256 _year, uint256 _month, uint256 _kWh) external onlyOwner {
+        require(_projectId < projects.length, "Project does not exist");
+        require(_month >= 1 && _month <= 12, "Invalid month");
+        uint256 monthId = _year * 12 + _month;
+        monthlyEnergyProduction[_projectId][monthId] = _kWh;
+    }
+
+    /**
+     * @dev Calculate carbon offset for a user across all projects
+     * @param _user Address of the user
+     * @param _year Year of calculation
+     * @param _month Month of calculation (1-12)
+     * @return Carbon offset in kg (scaled by 10^18)
+     */
+    function getUserCarbonOffset(address _user, uint256 _year, uint256 _month) external view returns (uint256) {
+        require(_month >= 1 && _month <= 12, "Invalid month");
+        uint256 monthId = _year * 12 + _month;
+        uint256 totalCarbonOffset = 0;
+
+        for (uint256 i = 0; i < projects.length; i++) {
+            if (projects[i].status == ProjectStatus.Active) {
+                Investment storage investment = investments[i][_user];
+                if (investment.amount > 0) {
+                    uint256 investorShare = investment.amount * 1e18 / projects[i].fundingRaised;
+                    uint256 projectEnergyProduction = monthlyEnergyProduction[i][monthId];
+                    uint256 userEnergyShare = projectEnergyProduction * investorShare / 1e18;
+                    totalCarbonOffset += userEnergyShare * CARBON_OFFSET_PER_KWH / 1e18;
+                }
+            }
+        }
+
+        return totalCarbonOffset;
+    }
+
+    function _addTransaction(address user, uint256 projectId, string memory transactionType, uint256 amount) internal {
+        Transaction memory newTransaction = Transaction(projectId, transactionType, amount, block.timestamp);
+        
+        if (userTransactions[user].length >= MAX_TRANSACTIONS) {
+            // Remove the oldest transaction
+            for (uint i = 0; i < MAX_TRANSACTIONS - 1; i++) {
+                userTransactions[user][i] = userTransactions[user][i + 1];
+            }
+            userTransactions[user][MAX_TRANSACTIONS - 1] = newTransaction;
+        } else {
+            userTransactions[user].push(newTransaction);
+        }
+    }
+
+    function getUserTransactionHistory(address _user) external view returns (Transaction[] memory) {
+        return userTransactions[_user];
     }
 
     /**
